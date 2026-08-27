@@ -380,11 +380,6 @@ static int run_client(const char* endpoint, int argc, char* argv[], int server_i
     if (prepare_client_request(argc, argv, server_index, server_has_separate_value, &request, &image_path) != 0)
         return 1;
     if (image_path != NULL) {
-        size_t path_length = strlen(image_path);
-        if (path_length < 4 || strcasecmp(image_path + path_length - 4, ".bin") != 0) {
-            fprintf(stderr, "Error: the first network version supports BIN input images only.\n");
-            return 1;
-        }
         image_fd = open(image_path, O_RDONLY);
         if (image_fd < 0) {
             fprintf(stderr, "Error: cannot open image '%s': %s.\n", image_path, strerror(errno));
