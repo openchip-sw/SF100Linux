@@ -5,6 +5,7 @@
 #include "board.h"
 #include "project.h"
 #include "usbdriver.h"
+#include "network.h"
 #include <fcntl.h>
 #include <getopt.h>
 #include <pthread.h>
@@ -582,6 +583,7 @@ int main(int argc, char* argv[])
 	return;
 
 #endif
+    int network_result;
     int c;
 	int temp = 0;
     int iExitCode = EXCODE_PASS;
@@ -590,6 +592,11 @@ int main(int argc, char* argv[])
     bool bDeviceSN = false;
     unsigned long r;
     char* env;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    network_result = NetworkHandleMode(argc, argv);
+    if (network_result != NETWORK_MODE_NOT_REQUESTED)
+        return network_result;
 
     printf("\nDpCmd %s 1.14.22.%02d Engine Version:\nLast Built on %s\n\n",
 #if defined(__APPLE__)
@@ -1109,8 +1116,10 @@ void cli_classic_usage(bool IsShowExample)
                "Remark: -x only works with -p");
 
     printf("(space is not needed between the switches and parameters. E.g. dpcmd -ubio.bin)\n");
-	printf("SPI NOR : Basic Switches(switches in this group are mutual exclusive):\n");
+    printf("SPI NOR : Basic Switches(switches in this group are mutual exclusive):\n");
     printf("    -? [ --help ]                           show this help message\n"
+           "    --listen [ADDRESS:]PORT                 run as a single-client network server\n"
+           "    --server HOST:PORT                     execute through a network server\n"
            "    --list                                  print supported chip list\n"
            "    --check        			    get programmer information\n"
            "    -d [ --detect ]                         detect chip\n"
@@ -2562,4 +2571,3 @@ bool ScanBB(void)
 	do_ScanBB();
 	return g_bStatus;
 }
-
