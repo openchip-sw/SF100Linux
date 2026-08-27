@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdint.h>
@@ -10,61 +11,67 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define NETWORK_MAGIC "DPCMDN01"
-#define NETWORK_MAGIC_SIZE 8
-#define NETWORK_MAX_ARGS 128
-#define NETWORK_MAX_ARG_SIZE (64U * 1024U)
-#define NETWORK_MAX_FILE_SIZE (1024ULL * 1024ULL * 1024ULL)
-#define NETWORK_NO_FILE UINT32_MAX
-#define NETWORK_OUTPUT_FRAME 'O'
-#define NETWORK_EXIT_FRAME 'X'
+#define NETWORK_MAGIC 0x4450434eU /* "DPCN" */
+#define NETWORK_VERSION 1U
+#define NETWORK_MAX_ARGS 128U
+#define NETWORK_MAX_ARG_LENGTH 4096U
+#define NETWORK_MAX_IMAGE_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
+#define NETWORK_IO_SIZE 65536U
+#define NETWORK_NO_IMAGE UINT32_MAX
 
-struct command_request {
+struct NetworkRequest {
     uint32_t argc;
+    uint32_t image_index;
+    uint64_t image_size;
     char** argv;
-    uint32_t file_index;
-    uint64_t file_size;
 };
 
-static int write_all(int fd, const void* data, size_t size)
+static uint64_t host_to_network64(uint64_t value)
 {
-    const unsigned char* p = data;
+    uint32_t high = htonl((uint32_t)(value >> 32));
+    uint32_t low = htonl((uint32_t)value);
+    return ((uint64_t)low << 32) | high;
+}
 
-    while (size != 0) {
-        ssize_t written = write(fd, p, size);
-        if (written < 0) {
-            if (errno == EINTR)
-                continue;
+static uint64_t network_to_host64(uint64_t value)
+{
+    uint32_t high = ntohl((uint32_t)value);
+    uint32_t low = ntohl((uint32_t)(value >> 32));
+    return ((uint64_t)high << 32) | low;
+}
+
+static int send_all(int fd, const void* data, size_t length)
+{
+    const unsigned char* cursor = data;
+
+    while (length > 0) {
+        ssize_t sent = send(fd, cursor, length, 0);
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent <= 0)
             return -1;
-        }
-        if (written == 0)
-            return -1;
-        p += written;
-        size -= (size_t)written;
+        cursor += sent;
+        length -= (size_t)sent;
     }
     return 0;
 }
 
-static int read_all(int fd, void* data, size_t size)
+static int receive_all(int fd, void* data, size_t length)
 {
-    unsigned char* p = data;
+    unsigned char* cursor = data;
 
-    while (size != 0) {
-        ssize_t received = read(fd, p, size);
-        if (received < 0) {
-            if (errno == EINTR)
-                continue;
+    while (length > 0) {
+        ssize_t received = recv(fd, cursor, length, 0);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0)
             return -1;
-        }
-        if (received == 0)
-            return -1;
-        p += received;
-        size -= (size_t)received;
+        cursor += received;
+        length -= (size_t)received;
     }
     return 0;
 }
@@ -72,658 +79,527 @@ static int read_all(int fd, void* data, size_t size)
 static int send_u32(int fd, uint32_t value)
 {
     value = htonl(value);
-    return write_all(fd, &value, sizeof(value));
+    return send_all(fd, &value, sizeof(value));
 }
 
 static int receive_u32(int fd, uint32_t* value)
 {
-    uint32_t wire_value;
-
-    if (read_all(fd, &wire_value, sizeof(wire_value)) < 0)
+    if (receive_all(fd, value, sizeof(*value)) != 0)
         return -1;
-    *value = ntohl(wire_value);
+    *value = ntohl(*value);
     return 0;
 }
 
-static int send_u64(int fd, uint64_t value)
+static int split_endpoint(const char* endpoint, int listener, char* host, size_t host_size, char* port, size_t port_size)
 {
-    uint32_t words[2];
+    const char* separator = strrchr(endpoint, ':');
+    const char* port_value;
+    size_t host_length;
 
-    words[0] = htonl((uint32_t)(value >> 32));
-    words[1] = htonl((uint32_t)value);
-    return write_all(fd, words, sizeof(words));
-}
-
-static int receive_u64(int fd, uint64_t* value)
-{
-    uint32_t words[2];
-
-    if (read_all(fd, words, sizeof(words)) < 0)
-        return -1;
-    *value = ((uint64_t)ntohl(words[0]) << 32) | ntohl(words[1]);
-    return 0;
-}
-
-static int send_frame(int fd, unsigned char type, const void* data, uint32_t size)
-{
-    if (write_all(fd, &type, 1) < 0 || send_u32(fd, size) < 0)
-        return -1;
-    return size == 0 ? 0 : write_all(fd, data, size);
-}
-
-static void send_error(int fd, const char* message)
-{
-    uint32_t status = htonl(2);
-
-    send_frame(fd, NETWORK_OUTPUT_FRAME, message, (uint32_t)strlen(message));
-    send_frame(fd, NETWORK_EXIT_FRAME, &status, sizeof(status));
-}
-
-static int parse_endpoint(const char* text, int listen_mode, char** host, char** port)
-{
-    const char* colon;
-    const char* port_start;
-    size_t host_len;
-    char* end;
-    long number;
-
-    *host = NULL;
-    *port = NULL;
-    if (text == NULL || *text == '\0')
-        return -1;
-
-    if (text[0] == '[') {
-        const char* close = strchr(text, ']');
-        if (close == NULL || close[1] != ':' || close[2] == '\0')
+    if (separator == NULL) {
+        if (!listener) {
+            fprintf(stderr, "Error: --server expects HOST:PORT.\n");
             return -1;
-        host_len = (size_t)(close - text - 1);
-        *host = strndup(text + 1, host_len);
-        port_start = close + 2;
-    } else {
-        colon = strrchr(text, ':');
-        if (colon == NULL) {
-            if (!listen_mode)
-                return -1;
-            *host = strdup("127.0.0.1");
-            port_start = text;
-        } else {
-            host_len = (size_t)(colon - text);
-            if (host_len == 0)
-                *host = listen_mode ? NULL : strdup("");
-            else
-                *host = strndup(text, host_len);
-            port_start = colon + 1;
         }
+        strncpy(host, "127.0.0.1", host_size - 1);
+        host[host_size - 1] = '\0';
+        port_value = endpoint;
+    } else {
+        host_length = (size_t)(separator - endpoint);
+        if (host_length == 0 || host_length >= host_size) {
+            fprintf(stderr, "Error: invalid network address '%s'.\n", endpoint);
+            return -1;
+        }
+        memcpy(host, endpoint, host_length);
+        host[host_length] = '\0';
+        port_value = separator + 1;
     }
 
-    errno = 0;
-    number = strtol(port_start, &end, 10);
-    if (errno != 0 || *port_start == '\0' || *end != '\0' || number < 1 || number > 65535) {
-        free(*host);
-        *host = NULL;
+    if (*port_value == '\0' || strlen(port_value) >= port_size) {
+        fprintf(stderr, "Error: invalid network port in '%s'.\n", endpoint);
         return -1;
     }
-    *port = strdup(port_start);
-    if (*port == NULL || (listen_mode == 0 && (*host == NULL || **host == '\0'))) {
-        free(*host);
-        free(*port);
-        *host = NULL;
-        *port = NULL;
-        return -1;
-    }
+    strncpy(port, port_value, port_size - 1);
+    port[port_size - 1] = '\0';
     return 0;
 }
 
-static int connect_endpoint(const char* endpoint)
+static int open_connection(const char* endpoint)
 {
+    char host[256] = { 0 };
+    char port[16] = { 0 };
     struct addrinfo hints;
-    struct addrinfo* addresses;
+    struct addrinfo* addresses = NULL;
     struct addrinfo* address;
-    char* host;
-    char* port;
     int fd = -1;
     int error;
 
-    if (parse_endpoint(endpoint, 0, &host, &port) < 0) {
-        fprintf(stderr, "Error: invalid server address '%s' (expected HOST:PORT).\n", endpoint);
+    if (split_endpoint(endpoint, 0, host, sizeof(host), port, sizeof(port)) != 0)
         return -1;
-    }
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     error = getaddrinfo(host, port, &hints, &addresses);
     if (error != 0) {
-        fprintf(stderr, "Error: cannot resolve server '%s': %s.\n", endpoint, gai_strerror(error));
-        free(host);
-        free(port);
+        fprintf(stderr, "Error: cannot resolve %s: %s.\n", host, gai_strerror(error));
         return -1;
     }
+
     for (address = addresses; address != NULL; address = address->ai_next) {
         fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-        if (fd >= 0 && connect(fd, address->ai_addr, address->ai_addrlen) == 0)
+        if (fd < 0)
+            continue;
+        if (connect(fd, address->ai_addr, address->ai_addrlen) == 0)
             break;
-        if (fd >= 0)
-            close(fd);
+        close(fd);
         fd = -1;
     }
-    if (fd < 0)
-        fprintf(stderr, "Error: cannot connect to %s: %s.\n", endpoint, strerror(errno));
     freeaddrinfo(addresses);
-    free(host);
-    free(port);
+    if (fd < 0)
+        fprintf(stderr, "Error: cannot connect to %s.\n", endpoint);
     return fd;
 }
 
-static int create_listener(const char* endpoint)
+static int open_listener(const char* endpoint)
 {
+    char host[256] = { 0 };
+    char port[16] = { 0 };
     struct addrinfo hints;
-    struct addrinfo* addresses;
+    struct addrinfo* addresses = NULL;
     struct addrinfo* address;
-    char* host;
-    char* port;
     int fd = -1;
     int enabled = 1;
     int error;
 
-    if (parse_endpoint(endpoint, 1, &host, &port) < 0) {
-        fprintf(stderr, "Error: invalid listen address '%s' (expected [ADDRESS:]PORT).\n", endpoint);
+    if (split_endpoint(endpoint, 1, host, sizeof(host), port, sizeof(port)) != 0)
         return -1;
-    }
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
     error = getaddrinfo(host, port, &hints, &addresses);
     if (error != 0) {
-        fprintf(stderr, "Error: cannot resolve listen address '%s': %s.\n", endpoint, gai_strerror(error));
-        free(host);
-        free(port);
+        fprintf(stderr, "Error: cannot resolve listen address %s: %s.\n", host, gai_strerror(error));
         return -1;
     }
+
     for (address = addresses; address != NULL; address = address->ai_next) {
         fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
         if (fd < 0)
             continue;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
-        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0 && listen(fd, 4) == 0)
+        if (bind(fd, address->ai_addr, address->ai_addrlen) == 0 && listen(fd, 1) == 0)
             break;
         close(fd);
         fd = -1;
     }
-    if (fd < 0)
-        fprintf(stderr, "Error: cannot listen on %s: %s.\n", endpoint, strerror(errno));
     freeaddrinfo(addresses);
-    free(host);
-    free(port);
+    if (fd < 0)
+        fprintf(stderr, "Error: cannot listen on %s.\n", endpoint);
+    else
+        printf("Dpcmd network server listening on %s:%s\n", host, port);
     return fd;
 }
 
-static int is_long_option(const char* arg, const char* name)
+static const char* image_long_option(const char* argument)
 {
-    size_t length = strlen(name);
-    return strcmp(arg, name) == 0 || (strncmp(arg, name, length) == 0 && arg[length] == '=');
-}
-
-static int is_long_abbreviation(const char* arg, const char* name)
-{
-    const char* equal;
-    size_t length;
-
-    if (strncmp(arg, "--", 2) != 0)
-        return 0;
-    equal = strchr(arg, '=');
-    length = equal == NULL ? strlen(arg) : (size_t)(equal - arg);
-    return length < strlen(name) && length > 2 && strncmp(arg, name, length) == 0;
-}
-
-static int forbidden_option(const char* arg)
-{
-    static const char* const long_options[] = {
-        "--listen", "--server", "--read", "--raw-instruction",
-        "--raw-require-return", "--update-fw", "--log"
-    };
-    static const char short_options[] = { 'r', 'I', 'R', 'U', 'O' };
-    size_t i;
-
-    for (i = 0; i < sizeof(long_options) / sizeof(long_options[0]); ++i) {
-        if (is_long_option(arg, long_options[i]))
-            return 1;
-    }
-    if (arg[0] == '-' && arg[1] != '-' && arg[1] != '\0') {
-        for (i = 0; i < sizeof(short_options); ++i) {
-            if (arg[1] == short_options[i])
-                return 1;
-        }
-    }
-    return 0;
-}
-
-static const char* input_long_name(const char* arg)
-{
-    static const char* const names[] = {
-        "--prog", "--auto", "--batch", "--fsum", "--loadFile-with-verify"
+    static const char* options[] = {
+        "--auto", "--prog", "--batch", "--fsum", "--loadFile-with-verify"
     };
     size_t i;
 
-    for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
-        if (is_long_option(arg, names[i]))
-            return names[i];
+    for (i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+        size_t length = strlen(options[i]);
+        if (strcmp(argument, options[i]) == 0
+            || (strncmp(argument, options[i], length) == 0 && argument[length] == '='))
+            return options[i];
     }
     return NULL;
 }
 
-static int input_short_option(char option)
+static int image_short_option(const char* argument)
 {
-    return option == 'p' || option == 'u' || option == 'z' || option == 'f' || option == 'W';
+    return argument[0] == '-' && argument[1] != '\0' && strchr("upzfW", argument[1]) != NULL;
 }
 
-static int short_option_requires_argument(char option)
+static int add_request_argument(struct NetworkRequest* request, const char* value)
 {
-    return strchr("rpuzfIRalxTSNBtgcOk14UE", option) != NULL;
-}
-
-/* Return -1 for a forbidden option, its input-option offset, or zero. */
-static int analyze_short_options(const char* arg)
-{
-    size_t i;
-
-    if (arg[0] != '-' || arg[1] == '-' || arg[1] == '\0')
-        return 0;
-    for (i = 1; arg[i] != '\0'; ++i) {
-        if (strchr("rIRUO", arg[i]) != NULL)
-            return -1;
-        if (input_short_option(arg[i]))
-            return (int)i;
-        if (short_option_requires_argument(arg[i]))
-            return 0;
-    }
-    return 0;
-}
-
-static int unsafe_long_abbreviation(const char* arg)
-{
-    static const char* const path_options[] = {
-        "--listen", "--server", "--read", "--raw-instruction",
-        "--raw-require-return", "--update-fw", "--log", "--prog", "--auto",
-        "--batch", "--fsum", "--loadFile-with-verify"
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof(path_options) / sizeof(path_options[0]); ++i) {
-        if (is_long_abbreviation(arg, path_options[i]))
-            return 1;
-    }
-    return 0;
-}
-
-static void free_request(struct command_request* request)
-{
-    uint32_t i;
-
-    if (request->argv != NULL) {
-        for (i = 0; i < request->argc; ++i)
-            free(request->argv[i]);
-        free(request->argv);
-    }
-    memset(request, 0, sizeof(*request));
-    request->file_index = NETWORK_NO_FILE;
-}
-
-static int append_argument(struct command_request* request, const char* value)
-{
-    if (request->argc >= NETWORK_MAX_ARGS)
+    if (request->argc >= NETWORK_MAX_ARGS) {
+        fprintf(stderr, "Error: too many remote command arguments.\n");
         return -1;
-    request->argv[request->argc] = strdup(value);
-    if (request->argv[request->argc] == NULL)
-        return -1;
-    ++request->argc;
-    request->argv[request->argc] = NULL;
+    }
+    request->argv[request->argc++] = (char*)value;
     return 0;
 }
 
-static int build_client_request(int argc, char* argv[], int server_index,
-    struct command_request* request, const char** filename)
+static int prepare_client_request(int argc, char* argv[], int server_index, int server_has_separate_value,
+    struct NetworkRequest* request, const char** image_path)
 {
     int i;
 
     memset(request, 0, sizeof(*request));
-    request->file_index = NETWORK_NO_FILE;
-    request->argv = calloc(NETWORK_MAX_ARGS + 1, sizeof(char*));
+    request->image_index = NETWORK_NO_IMAGE;
+    request->argv = calloc(NETWORK_MAX_ARGS, sizeof(char*));
     if (request->argv == NULL)
         return -1;
-    if (append_argument(request, argv[0]) < 0)
-        goto invalid;
 
-    for (i = 1; i < argc; ++i) {
-        const char* long_name;
+    for (i = 1; i < argc; i++) {
+        const char* long_option;
         const char* value;
-        int short_input;
 
         if (i == server_index) {
-            if (strcmp(argv[i], "--server") == 0)
-                ++i;
+            if (server_has_separate_value)
+                i++;
             continue;
         }
-        short_input = analyze_short_options(argv[i]);
-        if (forbidden_option(argv[i]) || short_input < 0 || unsafe_long_abbreviation(argv[i])) {
-            fprintf(stderr, "Error: option '%s' is not allowed in network mode.\n", argv[i]);
-            goto invalid;
-        }
-        long_name = input_long_name(argv[i]);
-        if (long_name != NULL) {
-            const char* equal = strchr(argv[i], '=');
-            if (request->file_index != NETWORK_NO_FILE) {
-                fprintf(stderr, "Error: network mode accepts only one input image.\n");
-                goto invalid;
+
+        long_option = image_long_option(argv[i]);
+        if (long_option != NULL) {
+            const char* equals = strchr(argv[i], '=');
+            if (request->image_index != NETWORK_NO_IMAGE) {
+                fprintf(stderr, "Error: only one input image is supported per remote command.\n");
+                return -1;
             }
-            if (equal != NULL)
-                value = equal + 1;
+            if (add_request_argument(request, long_option) != 0)
+                return -1;
+            if (equals != NULL)
+                value = equals + 1;
             else if (++i < argc)
                 value = argv[i];
             else {
-                fprintf(stderr, "Error: option '%s' requires a file.\n", long_name);
-                goto invalid;
+                fprintf(stderr, "Error: %s needs an image file.\n", long_option);
+                return -1;
             }
-            if (*value == '\0' || strchr(value, '|') != NULL) {
-                fprintf(stderr, "Error: network mode requires one non-empty BIN image path.\n");
-                goto invalid;
-            }
-            if (append_argument(request, long_name) < 0 || append_argument(request, value) < 0)
-                goto invalid;
-            request->file_index = request->argc - 1;
-            *filename = value;
+            request->image_index = request->argc;
+            *image_path = value;
+            if (add_request_argument(request, value) != 0)
+                return -1;
             continue;
         }
-        if (short_input > 0) {
-            char option[3] = { '-', argv[i][short_input], '\0' };
-            int prefix;
-            if (request->file_index != NETWORK_NO_FILE) {
-                fprintf(stderr, "Error: network mode accepts only one input image.\n");
-                goto invalid;
+
+        if (image_short_option(argv[i])) {
+            char* option;
+            if (request->image_index != NETWORK_NO_IMAGE) {
+                fprintf(stderr, "Error: only one input image is supported per remote command.\n");
+                return -1;
             }
-            for (prefix = 1; prefix < short_input; ++prefix) {
-                char flag[3] = { '-', argv[i][prefix], '\0' };
-                if (append_argument(request, flag) < 0)
-                    goto invalid;
-            }
-            if (argv[i][short_input + 1] != '\0')
-                value = argv[i] + short_input + 1;
+            option = malloc(3);
+            if (option == NULL)
+                return -1;
+            option[0] = '-';
+            option[1] = argv[i][1];
+            option[2] = '\0';
+            if (add_request_argument(request, option) != 0)
+                return -1;
+            if (argv[i][2] != '\0')
+                value = argv[i] + 2;
             else if (++i < argc)
                 value = argv[i];
             else {
-                fprintf(stderr, "Error: option '%s' requires a file.\n", option);
-                goto invalid;
+                fprintf(stderr, "Error: %s needs an image file.\n", option);
+                return -1;
             }
-            if (*value == '\0' || strchr(value, '|') != NULL) {
-                fprintf(stderr, "Error: network mode requires one non-empty BIN image path.\n");
-                goto invalid;
-            }
-            if (append_argument(request, option) < 0 || append_argument(request, value) < 0)
-                goto invalid;
-            request->file_index = request->argc - 1;
-            *filename = value;
+            request->image_index = request->argc;
+            *image_path = value;
+            if (add_request_argument(request, value) != 0)
+                return -1;
             continue;
         }
-        if (append_argument(request, argv[i]) < 0)
-            goto invalid;
-    }
-    return 0;
 
-invalid:
-    free_request(request);
-    return -1;
-}
-
-static int send_request(int fd, const struct command_request* request, int image_fd)
-{
-    unsigned char buffer[64 * 1024];
-    uint64_t remaining = request->file_size;
-    uint32_t i;
-
-    if (write_all(fd, NETWORK_MAGIC, NETWORK_MAGIC_SIZE) < 0 || send_u32(fd, request->argc) < 0)
-        return -1;
-    for (i = 0; i < request->argc; ++i) {
-        size_t length = strlen(request->argv[i]);
-        if (send_u32(fd, (uint32_t)length) < 0 || write_all(fd, request->argv[i], length) < 0)
+        if (add_request_argument(request, argv[i]) != 0)
             return -1;
     }
-    if (send_u32(fd, request->file_index) < 0 || send_u64(fd, request->file_size) < 0)
+    return 0;
+}
+
+static int send_request(int socket_fd, const struct NetworkRequest* request, int image_fd)
+{
+    uint64_t image_size = host_to_network64(request->image_size);
+    uint64_t remaining = request->image_size;
+    unsigned char buffer[NETWORK_IO_SIZE];
+    uint32_t i;
+
+    if (send_u32(socket_fd, NETWORK_MAGIC) != 0 || send_u32(socket_fd, NETWORK_VERSION) != 0
+        || send_u32(socket_fd, request->argc) != 0 || send_u32(socket_fd, request->image_index) != 0
+        || send_all(socket_fd, &image_size, sizeof(image_size)) != 0)
         return -1;
-    while (remaining != 0) {
-        size_t wanted = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
-        ssize_t count = read(image_fd, buffer, wanted);
+
+    for (i = 0; i < request->argc; i++) {
+        size_t length = strlen(request->argv[i]);
+        if (length > NETWORK_MAX_ARG_LENGTH || send_u32(socket_fd, (uint32_t)length) != 0
+            || send_all(socket_fd, request->argv[i], length) != 0)
+            return -1;
+    }
+
+    while (image_fd >= 0 && remaining > 0) {
+        size_t part = remaining > sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
+        ssize_t count = read(image_fd, buffer, part);
         if (count < 0 && errno == EINTR)
             continue;
-        if (count <= 0 || write_all(fd, buffer, (size_t)count) < 0)
+        if (count <= 0 || send_all(socket_fd, buffer, (size_t)count) != 0)
             return -1;
         remaining -= (uint64_t)count;
     }
     return 0;
 }
 
-static int receive_response(int fd)
+static int receive_client_result(int socket_fd)
 {
-    unsigned char type;
-    unsigned char buffer[64 * 1024];
+    unsigned char buffer[NETWORK_IO_SIZE];
+    uint32_t length;
+    uint32_t status;
 
     for (;;) {
-        uint32_t size;
-        uint32_t remaining;
-
-        if (read_all(fd, &type, 1) < 0 || receive_u32(fd, &size) < 0) {
-            fprintf(stderr, "Error: connection closed before the server returned a result.\n");
-            return 2;
+        if (receive_u32(socket_fd, &length) != 0) {
+            fprintf(stderr, "Error: connection lost while receiving server output.\n");
+            return 1;
         }
-        if (type == NETWORK_EXIT_FRAME) {
-            uint32_t status;
-            if (size != sizeof(status) || read_all(fd, &status, sizeof(status)) < 0) {
-                fprintf(stderr, "Error: invalid response from server.\n");
-                return 2;
-            }
-            return (int)ntohl(status);
-        }
-        if (type != NETWORK_OUTPUT_FRAME || size > NETWORK_MAX_ARG_SIZE) {
-            fprintf(stderr, "Error: invalid response from server.\n");
-            return 2;
-        }
-        remaining = size;
-        while (remaining != 0) {
-            uint32_t chunk = remaining < sizeof(buffer) ? remaining : (uint32_t)sizeof(buffer);
-            if (read_all(fd, buffer, chunk) < 0 || write_all(STDOUT_FILENO, buffer, chunk) < 0)
-                return 2;
-            remaining -= chunk;
+        if (length == 0)
+            break;
+        while (length > 0) {
+            size_t part = length > sizeof(buffer) ? sizeof(buffer) : length;
+            if (receive_all(socket_fd, buffer, part) != 0 || fwrite(buffer, 1, part, stdout) != part)
+                return 1;
+            length -= (uint32_t)part;
         }
     }
+    if (receive_u32(socket_fd, &status) != 0)
+        return 1;
+    return (int)status;
 }
 
-static int run_client(int argc, char* argv[], int server_index, const char* endpoint)
+static int run_client(const char* endpoint, int argc, char* argv[], int server_index, int server_has_separate_value)
 {
-    struct command_request request;
-    struct stat info;
-    const char* filename = NULL;
+    struct NetworkRequest request;
+    const char* image_path = NULL;
+    off_t image_size;
     int image_fd = -1;
-    int fd;
-    int result = 2;
+    int socket_fd;
+    int result;
 
-    if (build_client_request(argc, argv, server_index, &request, &filename) < 0)
-        return 2;
-    if (filename != NULL) {
-        image_fd = open(filename, O_RDONLY);
-        if (image_fd < 0 || fstat(image_fd, &info) < 0 || !S_ISREG(info.st_mode)) {
-            fprintf(stderr, "Error: cannot open regular input image '%s': %s.\n", filename, strerror(errno));
-            goto done;
+    if (prepare_client_request(argc, argv, server_index, server_has_separate_value, &request, &image_path) != 0)
+        return 1;
+    if (image_path != NULL) {
+        size_t path_length = strlen(image_path);
+        if (path_length < 4 || strcasecmp(image_path + path_length - 4, ".bin") != 0) {
+            fprintf(stderr, "Error: the first network version supports BIN input images only.\n");
+            return 1;
         }
-        request.file_size = (uint64_t)info.st_size;
-        if (request.file_size > NETWORK_MAX_FILE_SIZE) {
-            fprintf(stderr, "Error: input image is larger than the 1 GiB network limit.\n");
-            goto done;
+        image_fd = open(image_path, O_RDONLY);
+        if (image_fd < 0) {
+            fprintf(stderr, "Error: cannot open image '%s': %s.\n", image_path, strerror(errno));
+            return 1;
         }
+        image_size = lseek(image_fd, 0, SEEK_END);
+        if (image_size < 0 || (uint64_t)image_size > NETWORK_MAX_IMAGE_SIZE || lseek(image_fd, 0, SEEK_SET) < 0) {
+            fprintf(stderr, "Error: invalid or oversized image '%s'.\n", image_path);
+            close(image_fd);
+            return 1;
+        }
+        request.image_size = (uint64_t)image_size;
     }
-    fd = connect_endpoint(endpoint);
-    if (fd < 0)
-        goto done;
-    if (send_request(fd, &request, image_fd) < 0)
-        fprintf(stderr, "Error: failed to send command to server: %s.\n", strerror(errno));
-    else
-        result = receive_response(fd);
-    close(fd);
 
-done:
+    socket_fd = open_connection(endpoint);
+    if (socket_fd < 0) {
+        if (image_fd >= 0)
+            close(image_fd);
+        return 1;
+    }
+    printf("Connected to dpcmd server at %s.\n", endpoint);
+    result = send_request(socket_fd, &request, image_fd);
     if (image_fd >= 0)
         close(image_fd);
-    free_request(&request);
+    if (result != 0) {
+        fprintf(stderr, "Error: failed to send the remote command.\n");
+        close(socket_fd);
+        return 1;
+    }
+    result = receive_client_result(socket_fd);
+    close(socket_fd);
     return result;
 }
 
-static int receive_request(int fd, struct command_request* request, char* temp_path)
+static void free_request(struct NetworkRequest* request)
 {
-    char magic[NETWORK_MAGIC_SIZE];
     uint32_t i;
-    int temp_fd = -1;
+    if (request->argv != NULL) {
+        for (i = 0; i < request->argc; i++)
+            free(request->argv[i]);
+    }
+    free(request->argv);
+    memset(request, 0, sizeof(*request));
+}
+
+static int receive_request(int socket_fd, struct NetworkRequest* request)
+{
+    uint32_t magic;
+    uint32_t version;
+    uint64_t image_size;
+    uint32_t i;
 
     memset(request, 0, sizeof(*request));
-    request->file_index = NETWORK_NO_FILE;
-    if (read_all(fd, magic, sizeof(magic)) < 0 || memcmp(magic, NETWORK_MAGIC, sizeof(magic)) != 0
-        || receive_u32(fd, &request->argc) < 0 || request->argc == 0 || request->argc > NETWORK_MAX_ARGS)
+    if (receive_u32(socket_fd, &magic) != 0 || receive_u32(socket_fd, &version) != 0
+        || receive_u32(socket_fd, &request->argc) != 0 || receive_u32(socket_fd, &request->image_index) != 0
+        || receive_all(socket_fd, &image_size, sizeof(image_size)) != 0)
         return -1;
-    request->argv = calloc(request->argc + 1, sizeof(char*));
+    request->image_size = network_to_host64(image_size);
+    if (magic != NETWORK_MAGIC || version != NETWORK_VERSION || request->argc == 0
+        || request->argc > NETWORK_MAX_ARGS || request->image_size > NETWORK_MAX_IMAGE_SIZE
+        || (request->image_index != NETWORK_NO_IMAGE && request->image_index >= request->argc))
+        return -1;
+
+    request->argv = calloc(request->argc, sizeof(char*));
     if (request->argv == NULL)
         return -1;
-    for (i = 0; i < request->argc; ++i) {
+    for (i = 0; i < request->argc; i++) {
         uint32_t length;
-        if (receive_u32(fd, &length) < 0 || length == 0 || length > NETWORK_MAX_ARG_SIZE)
-            goto invalid;
+        if (receive_u32(socket_fd, &length) != 0 || length == 0 || length > NETWORK_MAX_ARG_LENGTH)
+            return -1;
         request->argv[i] = malloc((size_t)length + 1);
-        if (request->argv[i] == NULL || read_all(fd, request->argv[i], length) < 0)
-            goto invalid;
+        if (request->argv[i] == NULL || receive_all(socket_fd, request->argv[i], length) != 0)
+            return -1;
         request->argv[i][length] = '\0';
     }
-    if (receive_u32(fd, &request->file_index) < 0 || receive_u64(fd, &request->file_size) < 0
-        || request->file_size > NETWORK_MAX_FILE_SIZE)
-        goto invalid;
-    if ((request->file_index == NETWORK_NO_FILE) != (request->file_size == 0)) {
-        /* Empty files are valid, so NO_FILE is the authoritative value. */
-        if (request->file_index == NETWORK_NO_FILE && request->file_size != 0)
-            goto invalid;
-    }
-    if (request->file_index != NETWORK_NO_FILE) {
-        unsigned char buffer[64 * 1024];
-        uint64_t remaining = request->file_size;
-
-        if (request->file_index == 0 || request->file_index >= request->argc)
-            goto invalid;
-        strcpy(temp_path, "/tmp/dpcmd-network-XXXXXX");
-        temp_fd = mkstemp(temp_path);
-        if (temp_fd < 0)
-            goto invalid;
-        while (remaining != 0) {
-            size_t chunk = remaining < sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
-            if (read_all(fd, buffer, chunk) < 0 || write_all(temp_fd, buffer, chunk) < 0)
-                goto invalid;
-            remaining -= chunk;
-        }
-        if (close(temp_fd) < 0)
-            goto invalid;
-        temp_fd = -1;
-        free(request->argv[request->file_index]);
-        request->argv[request->file_index] = strdup(temp_path);
-        if (request->argv[request->file_index] == NULL)
-            goto invalid;
-    }
     return 0;
-
-invalid:
-    if (temp_fd >= 0)
-        close(temp_fd);
-    if (*temp_path != '\0')
-        unlink(temp_path);
-    free_request(request);
-    return -1;
 }
 
-static int validate_server_request(const struct command_request* request)
+static int unsupported_remote_argument(const char* argument)
+{
+    static const char* blocked[] = {
+        "--listen", "--server", "--read", "--update-fw", "--raw-instruction",
+        "--raw-require-return", "--log", "--sp", "--su"
+    };
+    size_t i;
+
+    if (argument[0] == '-' && argument[1] != '\0' && strchr("rIUROFM", argument[1]) != NULL)
+        return 1;
+    for (i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        size_t length = strlen(blocked[i]);
+        if (strcmp(argument, blocked[i]) == 0
+            || (strncmp(argument, blocked[i], length) == 0 && argument[length] == '='))
+            return 1;
+    }
+    return 0;
+}
+
+static int validate_request(const struct NetworkRequest* request)
 {
     uint32_t i;
-    uint32_t found_file = NETWORK_NO_FILE;
+    int found_image_option = 0;
 
-    for (i = 1; i < request->argc; ++i) {
-        int short_input = analyze_short_options(request->argv[i]);
-        if (forbidden_option(request->argv[i]) || short_input < 0
-            || unsafe_long_abbreviation(request->argv[i])
-            || (short_input > 0 && request->argv[i][2] != '\0')
-            || (input_long_name(request->argv[i]) != NULL
-                && strchr(request->argv[i], '=') != NULL))
+    for (i = 0; i < request->argc; i++) {
+        if (unsupported_remote_argument(request->argv[i]))
             return -1;
-        if ((strcmp(request->argv[i], "-p") == 0 || strcmp(request->argv[i], "-u") == 0
-                || strcmp(request->argv[i], "-z") == 0 || strcmp(request->argv[i], "-f") == 0
-                || strcmp(request->argv[i], "-W") == 0 || strcmp(request->argv[i], "--prog") == 0
-                || strcmp(request->argv[i], "--auto") == 0 || strcmp(request->argv[i], "--batch") == 0
-                || strcmp(request->argv[i], "--fsum") == 0
-                || strcmp(request->argv[i], "--loadFile-with-verify") == 0)) {
-            if (++i >= request->argc || found_file != NETWORK_NO_FILE)
+        if (image_long_option(request->argv[i]) != NULL
+            || (strlen(request->argv[i]) == 2 && image_short_option(request->argv[i]))) {
+            if (i + 1 != request->image_index)
                 return -1;
-            found_file = i;
+            found_image_option = 1;
         }
     }
-    return found_file == request->file_index ? 0 : -1;
-}
-
-static int executable_path(const char* fallback, char* path, size_t size)
-{
-#ifdef __linux__
-    ssize_t length = readlink("/proc/self/exe", path, size - 1);
-    if (length > 0 && (size_t)length < size) {
-        path[length] = '\0';
-        return 0;
-    }
-#endif
-    if (strlen(fallback) >= size)
+    if ((request->image_index == NETWORK_NO_IMAGE) != !found_image_option)
         return -1;
-    strcpy(path, fallback);
     return 0;
 }
 
-static void serve_connection(int fd, const char* program)
+static int receive_image(int socket_fd, uint64_t image_size, char* path, size_t path_size)
 {
-    struct command_request request;
-    char temp_path[] = "/tmp/dpcmd-network-XXXXXX";
-    char program_path[4096];
-    unsigned char buffer[16 * 1024];
-    int output_pipe[2];
-    int status;
-    pid_t child;
+    char temporary[] = "/tmp/dpcmd-network-XXXXXX";
+    unsigned char buffer[NETWORK_IO_SIZE];
+    uint64_t remaining = image_size;
+    int fd = mkstemp(temporary);
 
-    temp_path[0] = '\0';
-    if (receive_request(fd, &request, temp_path) < 0) {
-        send_error(fd, "Error: invalid network request.\n");
-        return;
+    if (fd < 0)
+        return -1;
+    while (remaining > 0) {
+        size_t part = remaining > sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
+        size_t written = 0;
+        if (receive_all(socket_fd, buffer, part) != 0) {
+            close(fd);
+            unlink(temporary);
+            return -1;
+        }
+        while (written < part) {
+            ssize_t count = write(fd, buffer + written, part - written);
+            if (count < 0 && errno == EINTR)
+                continue;
+            if (count <= 0) {
+                close(fd);
+                unlink(temporary);
+                return -1;
+            }
+            written += (size_t)count;
+        }
+        remaining -= part;
     }
-    if (validate_server_request(&request) < 0 || executable_path(program, program_path, sizeof(program_path)) < 0) {
-        send_error(fd, "Error: command is not allowed in network mode.\n");
-        goto done;
+    close(fd);
+    if (strlen(temporary) >= path_size) {
+        unlink(temporary);
+        return -1;
     }
-    free(request.argv[0]);
-    request.argv[0] = strdup(program_path);
-    if (request.argv[0] == NULL || pipe(output_pipe) < 0) {
-        send_error(fd, "Error: server could not start dpcmd.\n");
-        goto done;
+    strcpy(path, temporary);
+    return 0;
+}
+
+static int send_output_frame(int socket_fd, const void* data, uint32_t length)
+{
+    if (send_u32(socket_fd, length) != 0)
+        return -1;
+    return length == 0 ? 0 : send_all(socket_fd, data, length);
+}
+
+static void send_error_result(int socket_fd, const char* message)
+{
+    send_output_frame(socket_fd, message, (uint32_t)strlen(message));
+    send_output_frame(socket_fd, NULL, 0);
+    send_u32(socket_fd, 1);
+}
+
+static int run_local_command(int socket_fd, const char* executable, struct NetworkRequest* request, const char* image_path)
+{
+    char executable_path[PATH_MAX];
+    char** child_argv;
+    unsigned char buffer[NETWORK_IO_SIZE];
+    ssize_t executable_length;
+    int output_pipe[2];
+    pid_t child;
+    int status = 1;
+    uint32_t i;
+
+    executable_length = readlink("/proc/self/exe", executable_path, sizeof(executable_path) - 1);
+    if (executable_length >= 0)
+        executable_path[executable_length] = '\0';
+    else {
+        strncpy(executable_path, executable, sizeof(executable_path) - 1);
+        executable_path[sizeof(executable_path) - 1] = '\0';
     }
+
+    child_argv = calloc((size_t)request->argc + 2, sizeof(char*));
+    if (child_argv == NULL || pipe(output_pipe) != 0) {
+        free(child_argv);
+        return -1;
+    }
+    child_argv[0] = executable_path;
+    for (i = 0; i < request->argc; i++)
+        child_argv[i + 1] = (i == request->image_index) ? (char*)image_path : request->argv[i];
+
     child = fork();
     if (child < 0) {
         close(output_pipe[0]);
         close(output_pipe[1]);
-        send_error(fd, "Error: server could not start dpcmd.\n");
-        goto done;
+        free(child_argv);
+        return -1;
     }
     if (child == 0) {
         close(output_pipe[0]);
         dup2(output_pipe[1], STDOUT_FILENO);
         dup2(output_pipe[1], STDERR_FILENO);
         close(output_pipe[1]);
-        close(fd);
-        execv(program_path, request.argv);
+        execv(executable_path, child_argv);
+        dprintf(STDERR_FILENO, "Error: cannot execute local dpcmd: %s.\n", strerror(errno));
         _exit(127);
     }
+
     close(output_pipe[1]);
     for (;;) {
         ssize_t count = read(output_pipe[0], buffer, sizeof(buffer));
@@ -731,47 +607,71 @@ static void serve_connection(int fd, const char* program)
             continue;
         if (count <= 0)
             break;
-        if (send_frame(fd, NETWORK_OUTPUT_FRAME, buffer, (uint32_t)count) < 0)
+        if (send_output_frame(socket_fd, buffer, (uint32_t)count) != 0)
             break;
     }
     close(output_pipe[0]);
     while (waitpid(child, &status, 0) < 0 && errno == EINTR)
         ;
+    free(child_argv);
+
     if (WIFEXITED(status))
         status = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status))
-        status = 128 + WTERMSIG(status);
     else
-        status = 2;
-    {
-        uint32_t wire_status = htonl((uint32_t)status);
-        send_frame(fd, NETWORK_EXIT_FRAME, &wire_status, sizeof(wire_status));
+        status = 1;
+    send_output_frame(socket_fd, NULL, 0);
+    send_u32(socket_fd, (uint32_t)status);
+    return 0;
+}
+
+static void handle_client(int socket_fd, const char* executable)
+{
+    struct NetworkRequest request;
+    char image_path[PATH_MAX] = { 0 };
+
+    if (receive_request(socket_fd, &request) != 0) {
+        send_error_result(socket_fd, "Error: invalid or incomplete network request.\n");
+        free_request(&request);
+        return;
+    }
+    if (validate_request(&request) != 0) {
+        send_error_result(socket_fd, "Error: unsupported or invalid remote command.\n");
+        free_request(&request);
+        return;
+    }
+    if (request.image_index != NETWORK_NO_IMAGE
+        && receive_image(socket_fd, request.image_size, image_path, sizeof(image_path)) != 0) {
+        send_error_result(socket_fd, "Error: failed to receive the image.\n");
+        free_request(&request);
+        return;
     }
 
-done:
-    if (temp_path[0] != '\0')
-        unlink(temp_path);
+    if (run_local_command(socket_fd, executable, &request, image_path) != 0)
+        send_error_result(socket_fd, "Error: failed to start the local flash command.\n");
+    if (image_path[0] != '\0')
+        unlink(image_path);
     free_request(&request);
 }
 
-static int run_server(const char* endpoint, const char* program)
+static int run_server(const char* endpoint, const char* executable)
 {
-    int listener = create_listener(endpoint);
-
+    int listener = open_listener(endpoint);
     if (listener < 0)
-        return 2;
-    printf("Listening for dpcmd clients on %s\n", endpoint);
+        return 1;
+
     for (;;) {
-        int fd = accept(listener, NULL, NULL);
-        if (fd < 0) {
-            if (errno == EINTR)
-                continue;
-            fprintf(stderr, "Error: accept failed: %s.\n", strerror(errno));
+        int client = accept(listener, NULL, NULL);
+        if (client < 0 && errno == EINTR)
+            continue;
+        if (client < 0) {
+            fprintf(stderr, "Error: failed to accept a client: %s.\n", strerror(errno));
             close(listener);
-            return 2;
+            return 1;
         }
-        serve_connection(fd, program);
-        close(fd);
+        printf("Client connected.\n");
+        handle_client(client, executable);
+        close(client);
+        printf("Client disconnected.\n");
     }
 }
 
@@ -780,58 +680,41 @@ int NetworkHandleMode(int argc, char* argv[])
     const char* listen_endpoint = NULL;
     const char* server_endpoint = NULL;
     int server_index = -1;
+    int server_has_separate_value = 0;
     int i;
 
-    for (i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--listen") == 0 || strcmp(argv[i], "--server") == 0) {
-            int is_server = strcmp(argv[i], "--server") == 0;
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Error: %s requires an address.\n", argv[i]);
-                return 2;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--listen") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: --listen needs [ADDRESS:]PORT.\n");
+                return 1;
             }
-            if (is_server) {
-                if (server_endpoint != NULL) {
-                    fprintf(stderr, "Error: --server may only be specified once.\n");
-                    return 2;
-                }
-                server_endpoint = argv[i + 1];
-                server_index = i;
-            } else {
-                if (listen_endpoint != NULL) {
-                    fprintf(stderr, "Error: --listen may only be specified once.\n");
-                    return 2;
-                }
-                listen_endpoint = argv[i + 1];
-            }
-            ++i;
+            listen_endpoint = argv[i];
         } else if (strncmp(argv[i], "--listen=", 9) == 0) {
-            if (listen_endpoint != NULL) {
-                fprintf(stderr, "Error: --listen may only be specified once.\n");
-                return 2;
-            }
             listen_endpoint = argv[i] + 9;
-        } else if (strncmp(argv[i], "--server=", 9) == 0) {
-            if (server_endpoint != NULL) {
-                fprintf(stderr, "Error: --server may only be specified once.\n");
-                return 2;
-            }
-            server_endpoint = argv[i] + 9;
+        } else if (strcmp(argv[i], "--server") == 0) {
             server_index = i;
+            server_has_separate_value = 1;
+            if (++i >= argc) {
+                fprintf(stderr, "Error: --server needs HOST:PORT.\n");
+                return 1;
+            }
+            server_endpoint = argv[i];
+        } else if (strncmp(argv[i], "--server=", 9) == 0) {
+            server_index = i;
+            server_endpoint = argv[i] + 9;
         }
+    }
+
+    if (listen_endpoint != NULL && server_endpoint != NULL) {
+        fprintf(stderr, "Error: --listen and --server cannot be used together.\n");
+        return 1;
     }
     if (listen_endpoint == NULL && server_endpoint == NULL)
         return NETWORK_MODE_NOT_REQUESTED;
-    if (listen_endpoint != NULL && server_endpoint != NULL) {
-        fprintf(stderr, "Error: --listen and --server cannot be used together.\n");
-        return 2;
-    }
+
     signal(SIGPIPE, SIG_IGN);
-    if (listen_endpoint != NULL) {
-        if (argc != 3 && !(argc == 2 && strncmp(argv[1], "--listen=", 9) == 0)) {
-            fprintf(stderr, "Error: --listen cannot be combined with a dpcmd operation.\n");
-            return 2;
-        }
+    if (listen_endpoint != NULL)
         return run_server(listen_endpoint, argv[0]);
-    }
-    return run_client(argc, argv, server_index, server_endpoint);
+    return run_client(server_endpoint, argc, argv, server_index, server_has_separate_value);
 }

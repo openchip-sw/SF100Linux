@@ -1,14 +1,11 @@
-#ifndef DPCMD_NETWORK_H
-#define DPCMD_NETWORK_H
+#pragma once
 
-/* Returned when neither --listen nor --server was present. */
+#ifndef _NETWORK_H
+#define _NETWORK_H
+
 #define NETWORK_MODE_NOT_REQUESTED (-1)
 
-/*
- * Handle the network-only command line modes before dpcmd opens USB devices.
- * The return value is NETWORK_MODE_NOT_REQUESTED for a normal local command,
- * otherwise it is the exit status that main() should return.
- */
+/* Handle --listen and --server before USB is initialized. */
 int NetworkHandleMode(int argc, char* argv[]);
 
 #endif
