@@ -56,6 +56,8 @@ typedef struct {
 #define ERROR_ON (0 << 2)
 #define ERROR_OFF (1 << 2)
 
+extern const char* g_usb_serial_number;
+
 int usb_driver_init(void);
 int get_usb_dev_cnt(void);
 int usb_driver_release(void);

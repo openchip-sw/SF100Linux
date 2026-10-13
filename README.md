@@ -68,5 +68,32 @@ Alternatively, use `--device 2` on both server and client. A missing, mismatched
 duplicate, or mixed selector is rejected with a nonzero exit status before the
 local programmer command starts. A listener without a selector remains unrestricted.
 Serial IDs are preferable because device numbering can change after reconnection.
-This restriction checks the requested target; the current USB initialization still
-opens all attached programmers before local command options are parsed.
+Local command options are parsed before USB initialization. `--device` opens and
+claims only the selected programmer. Without a selector, dpcmd still operates on
+all attached programmers. Serial selection probes one available programmer at a
+time, releases nonmatches, and skips programmers already claimed by another process.
+
+For two simultaneous jobs, run a listener per programmer on different ports:
+
+```bash
+# Run these in separate terminals on the USB host.
+./dpcmd --listen 0.0.0.0:4001 --device 1
+./dpcmd --listen 0.0.0.0:4002 --device 2
+
+# Run these in separate client terminals.
+./dpcmd --server SERVER_IP:4001 --device 1 --auto first.bin --verify
+./dpcmd --server SERVER_IP:4002 --device 2 --auto second.bin --verify
+```
+
+For strict physical isolation, use `--busnum` and `--devnum` (decimal USB bus and
+address from `lsusb`), or set `DPCMD_USB_BUSNUM` and `DPCMD_USB_DEVNUM` when starting
+each listener. The listener's child commands inherit these environment variables.
+Filtering happens before opening USB handles; filtered device numbering starts at 1.
+USB addresses can change after reconnection.
+
+USB selection regression tests use a simulated backend and do not access hardware:
+
+```bash
+make
+python3 tests/test_usb_selection.py
+```

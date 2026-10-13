@@ -656,18 +656,10 @@ int main(int argc, char* argv[])
         g_usb_busnum = (unsigned char)r;
     }
 
-    if (OpenUSB() == 0)
-        iExitCode = EXCODE_FAIL_USB;
-
-    LeaveStandaloneMode(0);
-    QueryBoard(0);
-
     while ((c = getopt_long(argc, argv, short_options, long_options, NULL)) != -1) {
         switch (c) {
         case '?':
             cli_classic_usage(true);
-            CloseProject();
-            ExitProgram();
             return EXCODE_PASS;
         case 'L':
             g_ucOperation |= LIST_TYPE;
@@ -752,7 +744,15 @@ int main(int argc, char* argv[])
             break;
         case 'D': // device
             bDevice = true;
-            sscanf(optarg, "%x", &g_uiDevNum);
+            {
+                char* end;
+                r = strtoul(optarg, &end, 16);
+                if (!*optarg || *optarg == '-' || *end || r > MAX_Dev_Index) {
+                    fprintf(stderr, "Error: --device must be 0-10 in hexadecimal (0 selects all).\n");
+                    return EXCODE_FAIL_USB;
+                }
+                g_uiDevNum = r;
+            }
             break;
         case 'X': // device-SN
             device_sn_arg = optarg;
@@ -893,6 +893,36 @@ int main(int argc, char* argv[])
         }
     }
 
+    if (bDevice && bDeviceSN) {
+        fprintf(stderr, "Error: use either --device or --device-SN.\n");
+        return EXCODE_FAIL_USB;
+    }
+    if (bDeviceSN) {
+        const char* digits = device_sn_arg;
+        char* end;
+        if (!strncmp(digits, "S6B", 3))
+            digits += 3;
+        else if (!strncmp(digits, "SF", 2) || !strncmp(digits, "DP", 2))
+            digits += 2;
+        else {
+            fprintf(stderr, "Error: invalid programmer serial number.\n");
+            return EXCODE_FAIL_USB;
+        }
+        r = strtoul(digits, &end, 10);
+        if (!*digits || *digits == '-' || *end || r == 0 || r > 0xffffff) {
+            fprintf(stderr, "Error: invalid programmer serial number.\n");
+            return EXCODE_FAIL_USB;
+        }
+        g_usb_serial_number = device_sn_arg;
+    }
+    if (OpenUSB() == 0) {
+        CloseProject();
+        ExitProgram();
+        return EXCODE_FAIL_USB;
+    }
+    LeaveStandaloneMode(g_uiDevNum ? g_uiDevNum - 1 : 0);
+    QueryBoard(g_uiDevNum ? g_uiDevNum - 1 : 0);
+
     int dev_cnt = get_usb_dev_cnt();
 
     if (CheckProgrammerInfo()) {
@@ -903,21 +933,6 @@ int main(int argc, char* argv[])
     if (bDetect == true) {
         if (bDevice == false) {
             if (bDeviceSN) {
-                const char* arg_temp = &device_sn_arg[2];
-                int arg_int = atoi(arg_temp);
-
-                for (int i = 0; i < dev_cnt; i++) {
-                    int dwUID = ReadUID(i);
-                    if (arg_int == dwUID) {
-                        g_uiDevNum = i + 1;
-                        break;
-                    }
-                }
-                if (g_uiDevNum == 0) {
-                    fprintf(stderr, "Error: requested programmer serial number was not found.\n");
-                    iExitCode = EXCODE_FAIL_USB;
-                    goto Exit;
-                }
                 int dwUID = ReadUID(g_uiDevNum - 1);
                 if (is_SF700_Or_SF600PG2(g_uiDevNum - 1)) {
 		    		if (g_bIsSF700[g_uiDevNum - 1] == true) {
@@ -1005,23 +1020,6 @@ int main(int argc, char* argv[])
         }
         goto Exit;
     } else {
-        if (bDeviceSN) {
-            const char* arg_temp = &device_sn_arg[2];
-            int arg_int = atoi(arg_temp);
-
-            for (int i = 0; i < dev_cnt; i++) {
-                int dwUID = ReadUID(i);
-                if (arg_int == dwUID) {
-                    g_uiDevNum = i + 1;
-                    break;
-                }
-            }
-        }
-        if (bDeviceSN && g_uiDevNum == 0) {
-            fprintf(stderr, "Error: requested programmer serial number was not found.\n");
-            iExitCode = EXCODE_FAIL_USB;
-            goto Exit;
-        }
         WriteLog(iExitCode, true);
     }
 	
@@ -1409,7 +1407,7 @@ void FillNANDContext(void)
 
 int Handler(void)
 {
-    if (Is_usbworking(0) == true) {
+    if (Is_usbworking(g_uiDevNum ? g_uiDevNum - 1 : 0) == true) {
 #if 0
         if(m_vm.count("fix-device"))
         {
@@ -1468,7 +1466,7 @@ bool InitProject(void)
 {
     //printf("bool InitProject(void)\n");
     int dev_cnt = get_usb_dev_cnt();
-	if (Is_usbworking(0) == true) {
+	if (Is_usbworking(g_uiDevNum ? g_uiDevNum - 1 : 0) == true) {
 //    if (Is_usbworking(g_uiDevNum-1)) {
         int targets[4] = {
             STARTUP_APPLI_CARD,
@@ -1534,7 +1532,8 @@ bool InitProject(void)
 void CloseProject(void)
 {
     for (int i = 0; i < get_usb_dev_cnt(); i++) {
-        EnterStandaloneMode(i);
+        if (Is_usbworking(i))
+            EnterStandaloneMode(i);
     }
     usb_driver_release();
 }

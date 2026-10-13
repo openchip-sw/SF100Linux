@@ -1,12 +1,14 @@
 #include "usbdriver.h"
 #include "FlashCommand.h"
 #include "project.h"
+#include "board.h"
 #ifdef __FreeBSD__
 #include <libusb.h>
 #else
 #include <libusb-1.0/libusb.h>
 #endif
 #include <string.h>
+#include <stdlib.h>
 
 unsigned int m_nbDeviceDetected = 0;
 unsigned char DevIndex = 0;
@@ -34,6 +36,8 @@ static libusb_context* ctx = NULL;
  */
 unsigned g_usb_devnum = -1;
 unsigned g_usb_busnum = -1;
+const char* g_usb_serial_number = NULL;
+static bool interface_claimed[MAX_Dev_Index];
 
 bool Is_NewUSBCommand(int Index)
 {
@@ -42,7 +46,6 @@ bool Is_NewUSBCommand(int Index)
     } 
     return false;
 }
-extern unsigned char GetFPGAVersion(int Index);
 
 void usb_dev_init(void)
 {
@@ -128,10 +131,13 @@ static int FindUSBDevice(void)
     unsigned int pid = 0xdada;
 
     usb_db_init();
+    dev_index = 0;
 
     ssize_t count;
     libusb_device** devs;
     count = libusb_get_device_list(ctx, &devs);
+    if (count < 0)
+        return 0;
     for (size_t idx = 0; idx < count; ++idx) {
         libusb_device* device = devs[idx];
         struct libusb_device_descriptor desc = { 0 };
@@ -140,12 +146,16 @@ static int FindUSBDevice(void)
             printf("Error getting device descriptor\n");
             break;
         }
-        if (desc.idVendor == vid && desc.idProduct == pid) {
-            usb_device_entry[dev_index].usb_device = device;
+        if (desc.idVendor == vid && desc.idProduct == pid
+            && (g_usb_busnum == (unsigned)-1 || libusb_get_bus_number(device) == g_usb_busnum)
+            && (g_usb_devnum == (unsigned)-1 || libusb_get_device_address(device) == g_usb_devnum)
+            && dev_index < MAX_Dev_Index) {
+            usb_device_entry[dev_index].usb_device = libusb_ref_device(device);
             usb_device_entry[dev_index].valid = 1;
             dev_index++;
         }
     }
+    libusb_free_device_list(devs, 1);
     printf(" \n"); 
     return dev_index;
 }
@@ -473,99 +483,108 @@ int dediprog_set_spi_clk(int khz, int Index)
     return 0;
 }
 
+/* Avoid resetting programmers that already have the required configuration. */
+static int open_programmer(int index)
+{
+    int ret = libusb_open(usb_device_entry[index].usb_device, &dediprog_handle[index]);
+    int configuration;
+    if (ret < 0)
+        return ret;
+    ret = libusb_get_configuration(dediprog_handle[index], &configuration);
+    if (ret < 0)
+        goto fail;
+    if (configuration != 1) {
+        ret = libusb_set_configuration(dediprog_handle[index], 1);
+        if (ret < 0)
+            goto fail;
+    }
+    ret = libusb_claim_interface(dediprog_handle[index], 0);
+    if (ret < 0)
+        goto fail;
+    interface_claimed[index] = true;
+    return 0;
+fail:
+    if (interface_claimed[index])
+        libusb_release_interface(dediprog_handle[index], 0);
+    interface_claimed[index] = false;
+    libusb_close(dediprog_handle[index]);
+    dediprog_handle[index] = NULL;
+    return ret;
+}
+
 int usb_driver_init(void)
 {
-    //printf("\n===>usbdrive.c --- usb_driver_init\n");
-    //  struct usb_bus *bus;
-    // struct usb_device *dev;
-    bool result = false;
-    int device_cnt = 0;
-    int ret;
-
-    for (int i = 0; i < MAX_Dev_Index; i++) {
-        dediprog_handle[i] = NULL;
-    }
+    int device_cnt;
     usb_dev_init();
-
+    if (!ctx)
+        return 0;
     device_cnt = FindUSBDevice();
-
-    if (g_uiDevNum == 0) {
-        for (int i = 0; i < device_cnt; i++) {
-            if (usb_device_entry[i].valid == 0) {
-                printf("Error: Programmers are not connected.\n");
-                return 0;
-            }
-
-            ret = libusb_open(usb_device_entry[i].usb_device, &dediprog_handle[i]);
-            if (dediprog_handle[i] == NULL) {
-                printf("Error: Programmers are not connected.\n");
-                return 0;
-            }
-            ret = libusb_set_configuration(dediprog_handle[i], 1);
-
-            if (ret) {
-                printf("Error: Programmers USB set configuration: 0x%x.\n", ret);
-                return 0;
-            }
-            ret = libusb_claim_interface(dediprog_handle[i], 0);
-            if (ret) {
-                printf("Error: Programmers USB claim interface: 0x%x.\n", ret);
-                return 0;
-            }
-
-            dediprog_start_appli(i);
-            AssignSF600orSF700var(i); 
-            result = (dediprog_handle[i] != NULL);
-        }
-    } else {
-        if (usb_device_entry[g_uiDevNum - 1].valid == 0) {
-            printf("Error: Programmers are not connected.\n");
-            return 0;
-        }
-
-        ret = libusb_open(usb_device_entry[g_uiDevNum - 1].usb_device, &dediprog_handle[g_uiDevNum - 1]);
-        if (dediprog_handle[g_uiDevNum - 1] == NULL) {
-            printf("Error: Programmers are not connected.\n");
-            return 0;
-        }
-        //printf("dediprog_handle[%d]=%p\n", g_uiDevNum - 1, dediprog_handle[g_uiDevNum - 1]);
-        ret = libusb_set_configuration(dediprog_handle[g_uiDevNum - 1], 1);
-
-        if (ret) {
-            printf("Error: Programmers USB set configuration: 0x%x.\n", ret);
-            return 0;
-        }
-        ret = libusb_claim_interface(dediprog_handle[g_uiDevNum - 1], 0);
-        if (ret) {
-            printf("Error: Programmers USB claim interface: 0x%x.\n", ret);
-            return 0;
-        }
-
-        dediprog_start_appli(g_uiDevNum - 1);
-
-        AssignSF600orSF700var(g_uiDevNum - 1);
-
-        result = (dediprog_handle[g_uiDevNum - 1] != NULL);
+    if (!device_cnt || g_uiDevNum > (unsigned)device_cnt) {
+        fprintf(stderr, "Error: requested programmer is not connected.\n");
+        return 0;
     }
-
-    return result; //((dediprog_handle[i] != NULL)? 1:0);
+    for (int i = 0; i < device_cnt; i++) {
+        int ret;
+        if (g_uiDevNum && i != (int)g_uiDevNum - 1)
+            continue;
+        ret = open_programmer(i);
+        if (ret < 0) {
+            if (g_usb_serial_number && ret == LIBUSB_ERROR_BUSY)
+                continue;
+            fprintf(stderr, "Error: cannot claim programmer %d: %s.\n", i + 1, libusb_strerror(ret));
+            return 0;
+        }
+        dediprog_start_appli(i);
+        AssignSF600orSF700var(i);
+        if (g_usb_serial_number) {
+            const char* digits = g_usb_serial_number + 2;
+            /* SF7 is a model prefix for SF700; SF100/SF600 IDs may start with 7. */
+            if (!strncmp(g_usb_serial_number, "S6B", 3)
+                || (g_bIsSF700[i] && !strncmp(g_usb_serial_number, "SF7", 3)))
+                digits++;
+            if (ReadUID(i) == strtoul(digits, NULL, 10)) {
+                g_uiDevNum = i + 1;
+                return 1;
+            }
+            libusb_release_interface(dediprog_handle[i], 0);
+            interface_claimed[i] = false;
+            libusb_close(dediprog_handle[i]);
+            dediprog_handle[i] = NULL;
+        }
+    }
+    if (g_usb_serial_number) {
+        fprintf(stderr, "Error: requested programmer serial number was not found or is busy.\n");
+        return 0;
+    }
+    return 1;
 }
 
 int usb_driver_release(void)
 {
     for (int i = 0; i < dev_index; i++) {
-        if (dediprog_handle[i] == NULL)
-            return 0;
-        libusb_release_interface(dediprog_handle[i], 0);
-        libusb_close(dediprog_handle[i]);
+        if (dediprog_handle[i]) {
+            if (interface_claimed[i])
+                libusb_release_interface(dediprog_handle[i], 0);
+            libusb_close(dediprog_handle[i]);
+            dediprog_handle[i] = NULL;
+        }
+        interface_claimed[i] = false;
+        if (usb_device_entry[i].valid) {
+            libusb_unref_device(usb_device_entry[i].usb_device);
+            usb_device_entry[i].valid = 0;
+        }
+    }
+    if (ctx) {
+        libusb_exit(ctx);
+        ctx = NULL;
     }
     return 0;
 }
- 
+
 bool Is_usbworking(int Index)
 {
     usleep(1000); // unknow reson
-    return ((dediprog_handle[Index] != NULL) ? true : false);
+    return Index >= 0 && Index < MAX_Dev_Index && dediprog_handle[Index] != NULL;
 }
 //long long flash_ReadId(boost::tuple<unsigned int /*RDID code*/, unsigned int/*inByteCount*/, unsigned int/*outByteCount*/> command,int Index)
 long flash_ReadId(unsigned int read_id_code, unsigned int out_data_size, int Index)
