@@ -590,6 +590,7 @@ int main(int argc, char* argv[])
     bool bDetect = false;
     bool bDevice = false;
     bool bDeviceSN = false;
+    const char* device_sn_arg = NULL;
     unsigned long r;
     char* env;
 
@@ -754,7 +755,7 @@ int main(int argc, char* argv[])
             sscanf(optarg, "%x", &g_uiDevNum);
             break;
         case 'X': // device-SN
-            l_opt_arg = optarg;
+            device_sn_arg = optarg;
             //printf("activate only the programmer connected to USBx (with arg: %s)\n", l_opt_arg);
 
             bDeviceSN = true;
@@ -902,7 +903,7 @@ int main(int argc, char* argv[])
     if (bDetect == true) {
         if (bDevice == false) {
             if (bDeviceSN) {
-                char* arg_temp = &l_opt_arg[2];
+                const char* arg_temp = &device_sn_arg[2];
                 int arg_int = atoi(arg_temp);
 
                 for (int i = 0; i < dev_cnt; i++) {
@@ -911,6 +912,11 @@ int main(int argc, char* argv[])
                         g_uiDevNum = i + 1;
                         break;
                     }
+                }
+                if (g_uiDevNum == 0) {
+                    fprintf(stderr, "Error: requested programmer serial number was not found.\n");
+                    iExitCode = EXCODE_FAIL_USB;
+                    goto Exit;
                 }
                 int dwUID = ReadUID(g_uiDevNum - 1);
                 if (is_SF700_Or_SF600PG2(g_uiDevNum - 1)) {
@@ -1000,7 +1006,7 @@ int main(int argc, char* argv[])
         goto Exit;
     } else {
         if (bDeviceSN) {
-            char* arg_temp = &l_opt_arg[2];
+            const char* arg_temp = &device_sn_arg[2];
             int arg_int = atoi(arg_temp);
 
             for (int i = 0; i < dev_cnt; i++) {
@@ -1010,6 +1016,11 @@ int main(int argc, char* argv[])
                     break;
                 }
             }
+        }
+        if (bDeviceSN && g_uiDevNum == 0) {
+            fprintf(stderr, "Error: requested programmer serial number was not found.\n");
+            iExitCode = EXCODE_FAIL_USB;
+            goto Exit;
         }
         WriteLog(iExitCode, true);
     }

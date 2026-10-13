@@ -53,3 +53,20 @@ Using only a port (for example, `--listen 9000`) binds the server to
 should only be exposed on a trusted network. It supports one input BIN image
 per command and intentionally does not allow remote reads, raw instructions,
 firmware updates, or server-side log paths.
+
+To restrict a server to one programmer, specify its selector when starting the
+listener. Every client request must supply the same selector type and value:
+
+```bash
+# Server
+./dpcmd --listen 0.0.0.0:9000 --device-SN SF129624
+# Client
+./dpcmd --server SERVER_IP:9000 --device-SN SF129624 --detect
+```
+
+Alternatively, use `--device 2` on both server and client. A missing, mismatched,
+duplicate, or mixed selector is rejected with a nonzero exit status before the
+local programmer command starts. A listener without a selector remains unrestricted.
+Serial IDs are preferable because device numbering can change after reconnection.
+This restriction checks the requested target; the current USB initialization still
+opens all attached programmers before local command options are parsed.

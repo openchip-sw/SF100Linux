@@ -497,6 +497,80 @@ static int validate_request(const struct NetworkRequest* request)
     return 0;
 }
 
+/* A listener may require one explicit programmer selector on every request. */
+struct DeviceSelection {
+    const char* option;
+    const char* value;
+    unsigned long number;
+};
+
+static int parse_device_selection(int argc, char* const argv[], uint32_t image_index,
+    struct DeviceSelection* selection)
+{
+    int i;
+    memset(selection, 0, sizeof(*selection));
+    for (i = 0; i < argc; i++) {
+        const char* argument = argv[i];
+        const char* equals;
+        size_t length;
+        const char* option;
+        const char* value;
+        char* end;
+        if ((uint32_t)i == image_index)
+            continue;
+        /* Do not permit getopt abbreviations or an option terminator to bypass the check. */
+        if (strcmp(argument, "--") == 0)
+            return -1;
+        if (strncmp(argument, "--", 2) != 0)
+            continue;
+        equals = strchr(argument, '=');
+        length = equals ? (size_t)(equals - argument) : strlen(argument);
+        if (length == strlen("--device") && strncmp(argument, "--device", length) == 0)
+            option = "--device";
+        else if (length == strlen("--device-SN") && strncmp(argument, "--device-SN", length) == 0)
+            option = "--device-SN";
+        else {
+            if (length <= strlen("--device-SN") && strncmp(argument, "--device-SN", length) == 0)
+                return -1;
+            continue;
+        }
+        if (selection->option != NULL)
+            return -1;
+        if (equals)
+            value = equals + 1;
+        else if (++i < argc && (uint32_t)i != image_index)
+            value = argv[i];
+        else
+            return -1;
+        if (*value == '\0' || *value == '-')
+            return -1;
+        selection->option = option;
+        selection->value = value;
+        if (strcmp(option, "--device") == 0) {
+            /* dpcmd parses --device in hexadecimal. Zero means all programmers. */
+            errno = 0;
+            selection->number = strtoul(value, &end, 16);
+            if (errno || *end || selection->number < 1 || selection->number > 16)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int validate_device_selection(const struct NetworkRequest* request,
+    const struct DeviceSelection* required)
+{
+    struct DeviceSelection selected;
+    if (required->option == NULL)
+        return 0;
+    if (parse_device_selection((int)request->argc, request->argv, request->image_index, &selected) != 0
+        || selected.option == NULL || strcmp(selected.option, required->option) != 0)
+        return -1;
+    if (strcmp(required->option, "--device") == 0)
+        return selected.number == required->number ? 0 : -1;
+    return strcmp(selected.value, required->value) == 0 ? 0 : -1;
+}
+
 static int receive_image(int socket_fd, uint64_t image_size, char* path, size_t path_size)
 {
     char temporary[] = "/tmp/dpcmd-network-XXXXXX";
@@ -550,7 +624,7 @@ static void send_error_result(int socket_fd, const char* message)
     send_u32(socket_fd, 1);
 }
 
-static int run_local_command(int socket_fd, const char* executable, struct NetworkRequest* request, const char* image_path)
+static int run_local_command(int socket_fd, const char* executable, struct NetworkRequest* request, const char* image_path, const struct DeviceSelection* required)
 {
     char executable_path[PATH_MAX];
     char** child_argv;
@@ -560,6 +634,7 @@ static int run_local_command(int socket_fd, const char* executable, struct Netwo
     pid_t child;
     int status = 1;
     uint32_t i;
+    size_t offset = required->option ? 3 : 1;
 
     executable_length = readlink("/proc/self/exe", executable_path, sizeof(executable_path) - 1);
     if (executable_length >= 0)
@@ -569,14 +644,19 @@ static int run_local_command(int socket_fd, const char* executable, struct Netwo
         executable_path[sizeof(executable_path) - 1] = '\0';
     }
 
-    child_argv = calloc((size_t)request->argc + 2, sizeof(char*));
+    child_argv = calloc((size_t)request->argc + offset + 1, sizeof(char*));
     if (child_argv == NULL || pipe(output_pipe) != 0) {
         free(child_argv);
         return -1;
     }
     child_argv[0] = executable_path;
+    /* Put the enforced selector first so another option cannot consume it as a value. */
+    if (required->option) {
+        child_argv[1] = (char*)required->option;
+        child_argv[2] = (char*)required->value;
+    }
     for (i = 0; i < request->argc; i++)
-        child_argv[i + 1] = (i == request->image_index) ? (char*)image_path : request->argv[i];
+        child_argv[i + offset] = (i == request->image_index) ? (char*)image_path : request->argv[i];
 
     child = fork();
     if (child < 0) {
@@ -619,7 +699,7 @@ static int run_local_command(int socket_fd, const char* executable, struct Netwo
     return 0;
 }
 
-static void handle_client(int socket_fd, const char* executable)
+static void handle_client(int socket_fd, const char* executable, const struct DeviceSelection* required)
 {
     struct NetworkRequest request;
     char image_path[PATH_MAX] = { 0 };
@@ -634,6 +714,14 @@ static void handle_client(int socket_fd, const char* executable)
         free_request(&request);
         return;
     }
+    if (validate_device_selection(&request, required) != 0) {
+        char message[NETWORK_MAX_ARG_LENGTH + 160];
+        snprintf(message, sizeof(message), "Error: server requires %s %s; client must specify the same selector exactly once.\n",
+            required->option, required->value);
+        send_error_result(socket_fd, message);
+        free_request(&request);
+        return;
+    }
     if (request.image_index != NETWORK_NO_IMAGE
         && receive_image(socket_fd, request.image_size, image_path, sizeof(image_path)) != 0) {
         send_error_result(socket_fd, "Error: failed to receive the image.\n");
@@ -641,14 +729,14 @@ static void handle_client(int socket_fd, const char* executable)
         return;
     }
 
-    if (run_local_command(socket_fd, executable, &request, image_path) != 0)
+    if (run_local_command(socket_fd, executable, &request, image_path, required) != 0)
         send_error_result(socket_fd, "Error: failed to start the local flash command.\n");
     if (image_path[0] != '\0')
         unlink(image_path);
     free_request(&request);
 }
 
-static int run_server(const char* endpoint, const char* executable)
+static int run_server(const char* endpoint, const char* executable, const struct DeviceSelection* required)
 {
     int listener = open_listener(endpoint);
     if (listener < 0)
@@ -664,7 +752,7 @@ static int run_server(const char* endpoint, const char* executable)
             return 1;
         }
         printf("Client connected.\n");
-        handle_client(client, executable);
+        handle_client(client, executable, required);
         close(client);
         printf("Client disconnected.\n");
     }
@@ -709,7 +797,13 @@ int NetworkHandleMode(int argc, char* argv[])
         return NETWORK_MODE_NOT_REQUESTED;
 
     signal(SIGPIPE, SIG_IGN);
-    if (listen_endpoint != NULL)
-        return run_server(listen_endpoint, argv[0]);
+    if (listen_endpoint != NULL) {
+        struct DeviceSelection required;
+        if (parse_device_selection(argc - 1, argv + 1, NETWORK_NO_IMAGE, &required) != 0) {
+            fprintf(stderr, "Error: specify at most one valid --device (1-16 in hexadecimal) or --device-SN for the server.\n");
+            return 1;
+        }
+        return run_server(listen_endpoint, argv[0], &required);
+    }
     return run_client(server_endpoint, argc, argv, server_index, server_has_separate_value);
 }
